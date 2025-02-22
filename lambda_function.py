@@ -6,6 +6,7 @@ import logging
 import psycopg2
 import pandas as pd
 from io import StringIO
+from datetime import datetime
 
 # Set up logging
 logger = logging.getLogger()
@@ -15,24 +16,21 @@ logger.setLevel(logging.INFO) # Priority of logs
 s3_client = boto3.client('s3')
 
 # AWS S3 Configuration
-TARGET_BUCKET = ""
+TARGET_BUCKET = "e-commerce-processed"
 
 # ! Helper functions
 def clean_date(date):
-    """ Clean the date field by converting from mm/dd/yyyy to yyyy-mm-dd. """
-    # Remove all non-numeric characters from the date
-    date = re.sub(r'\D', '', date)
-    # Split the date into parts and return in the format yyyy-mm-dd
-    date = date.split('/')
-    return f"{date[2]}-{date[0]}-{date[1]}" if len(date) == 3 else "1900-01-01"
+    """Clean the date field by converting from mm/dd/yyyy to yyyy-mm-dd."""
+    try:
+        # Try parsing as mm/dd/yyyy
+        parsed_date = datetime.strptime(date, "%m/%d/%Y")
+        return parsed_date.strftime("%Y-%m-%d")
+    except ValueError:
+        return "1900-01-01"  # Default date
 
 def clean_numeric(value):
     """ Clean the numeric field by removing all non-numeric characters. """
     return re.sub(r'\D', '', str(value))
-
-def clean_str(value):
-    """ Clean the string field by stripping empty spaces"""
-    return value.strip().rstrip() if value else ''
 
 # ! Data Cleaning Functions
 def clean_customers(df):
@@ -71,23 +69,104 @@ def clean_customers(df):
     df['HomeOwner'] = df['HomeOwner'].apply(lambda x: x if x in [True, False] else False)
     df['HomeOwner'] = df['HomeOwner'].astype(bool)
     
+    # Drop rows without a CustomerKey
+    df = df.dropna(subset=['CustomerKey'])
+    
     logger.info("Data cleaning complete for customers data.")
+    return df
 
 def cleanup_customers_new(df):
-    """ Clean the AdventureWorks Customers New data. """
-    pass
+    """Clean the AdventureWorks Customers New data."""
+    logger.info("Cleaning social media data...")
+    
+    # Remove rows where 'CustomerKey' is null
+    df = df.dropna(subset=['CustomerKey'])
+    
+    # Fill null values in 'Social Media Accounts' with 'NoSocialMedia'
+    df['Social Media Accounts'] = df['Social Media Accounts'].fillna('NoSocialMedia')
+    
+    # Split 'Social Media Accounts' into separate columns
+    social_media_df = df['Social Media Accounts'].str.get_dummies(sep=', ')    
+    # Concatenate with the original dataframe
+    df = pd.concat([df[['CustomerKey']], social_media_df], axis=1)
+    
+    logger.info("Data cleaning complete for customers social media data.")
+    return df
 
 def cleanup_sales(df):
     """ Clean any of the the AdventureWorks Sales datasets. """
-    pass
+    logger.info("Cleaning customer sales data...")
+    
+    # Rename the last column to 'OrderQuantity' if necessary
+    if df.columns[-1] != "OrderQuantity":
+        df.rename(columns={df.columns[-1]: "OrderQuantity"}, inplace=True)
+        
+    # Remove rows with missing 'OrderQuantity' values
+    df = df.dropna(subset=['OrderQuantity'])
+    
+    # Remove all non-numeric characters from numeric fields
+    df['OrderQuantity'] = df['OrderQuantity'].apply(clean_numeric)
+    df['ProductKey'] = df['ProductKey'].apply(clean_numeric)
+    df['CustomerKey'] = df['CustomerKey'].apply(clean_numeric)
+    df['TerritoryKey'] = df['TerritoryKey'].apply(clean_numeric)
+    df['OrderLineItem'] = df['OrderLineItem'].apply(clean_numeric)
+    
+    # Clean date fields
+    df["OrderDate"] = df["OrderDate"].apply(clean_date)
+    df["StockDate"] = df["StockDate"].apply(clean_date)
+    
+    # Extract year from OrderDate and store in a new column
+    df["OrderYear"] = pd.to_datetime(df["OrderDate"]).dt.year
+    
+    logger.info("Data cleaning complete for customer sales data.")
+    return df
 
 def cleanup_returns(df):
     """ Clean the AdventureWorks Returns data. """
-    pass
+    logger.info("Cleaning returns data...")
+
+    # Clean date field
+    df["ReturnDate"] = df["ReturnDate"].apply(clean_date)
+    
+    # Clean numeric fields
+    df["TerritoryKey"] = df["TerritoryKey"].apply(clean_numeric)
+    df["ProductKey"] = df["ProductKey"].apply(clean_numeric)
+    df["ReturnQuantity"] = df["ReturnQuantity"].apply(clean_numeric).astype(int)
+    
+    # Drop rows where ReturnQuantity < 1
+    df = df[df["ReturnQuantity"] >= 1]
+    
+    logger.info("Data cleaning complete for returns data.")
+    return df
 
 def cleanup_products(df):
     """ Clean the AdventureWorks Products data. """
-    pass
+    logger.info("Cleaning products data...")
+
+    # Drop rows with missing ProductKey
+    df = df.dropna(subset=["ProductKey"])
+
+    # Clean numeric fields
+    df["ProductKey"] = df["ProductKey"].apply(clean_numeric)
+    df["ProductSubcategoryKey"] = df["ProductSubcategoryKey"].apply(clean_numeric)
+    df["ProductCost"] = df["ProductCost"].apply(clean_numeric)
+    df["ProductPrice"] = df["ProductPrice"].apply(clean_numeric)
+    
+    # Fill missing values with appropriate defaults
+    df["ProductSKU"] = df["ProductSKU"].fillna("Unknown")
+    df["ProductName"] = df["ProductName"].fillna("Unknown")
+    df["ModelName"] = df["ModelName"].fillna("Unknown")
+    df["ProductDescription"] = df["ProductDescription"].fillna("No Description")
+    df["ProductColor"] = df["ProductColor"].fillna("NA")
+    df["ProductSize"] = df["ProductSize"].fillna("NA")
+    df["ProductStyle"] = df["ProductStyle"].fillna("NA")
+    
+    # Fill '0' in 'ProductSize' and 'ProductStyle' columns with 'NA'
+    df["ProductSize"] = df["ProductSize"].replace('0', 'NA')
+    df["ProductStyle"] = df["ProductStyle"].replace('0', 'NA')
+
+    logger.info("Data cleaning complete for products data.")    
+    return df
 
 def clean_data(df, filename):
     """ Clean the DataFrame before processing. """
@@ -107,7 +186,7 @@ def clean_data(df, filename):
     # Choose the type of processing required based on the filename
     if filename in cleanup_funcs:
         logger.info("Cleaning data for file: %s", filename)
-        cleanup_funcs[filename](df)
+        df = cleanup_funcs[filename](df)
     else:
         logger.info("No cleaning required for file: %s", filename)
 
@@ -150,10 +229,10 @@ def lambda_handler(event, context):
         df = clean_data(df, filename)
 
         # Redshift Credentials
-        host = ""
-        dbname = ""
-        user = ""
-        password = ""
+        host = "your-redshift-cluster-endpoint"
+        dbname = "your-database-name"
+        user = "your-username"
+        password = "your-password"
         
         # Get last word in file path for the table name
         tablename = filename.split('.')[0]
@@ -181,7 +260,7 @@ def lambda_handler(event, context):
         copy_query = """
             COPY {}
             FROM 's3://{}/{}'
-            IAM_ROLE 'arn:aws:iam::...'
+            IAM_ROLE 'your-iam-role-arn'
             FORMAT AS CSV
             DELIMITER ',';
         """.format(tablename, TARGET_BUCKET, target_filename)
